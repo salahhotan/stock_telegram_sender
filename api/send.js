@@ -1,190 +1,170 @@
-const { ApiClient, DefaultApi } = require('finnhub');
-const TelegramBot = require('node-telegram-bot-api');
+// /api/send.js
+import axios from 'axios';
+import dotenv from 'dotenv';
 
-// 1. ENHANCED CONFIGURATION VALIDATION ========================
-const validateConfig = () => {
-  const config = {
-    finnhubKey: process.env.FINNHUB_API_KEY?.trim(),
-    telegramToken: process.env.TELEGRAM_BOT_TOKEN?.trim(),
-    chatId: process.env.TELEGRAM_CHAT_ID?.trim()
-  };
+// Load environment variables from .env file if present (mainly for local development)
+// In Vercel, these should be set in the project settings.
+dotenv.config();
 
-  if (!config.finnhubKey) {
-    console.error('Missing FINNHUB_API_KEY');
-    throw new Error('Finnhub API key is required');
-  }
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-  if (!config.telegramToken) {
-    console.error('Missing TELEGRAM_BOT_TOKEN');
-    throw new Error('Telegram bot token is required');
-  }
+export default async function handler(req, res) {
+    // Allow CORS for all origins (you might want to restrict this in production)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (!config.chatId) {
-    console.error('Missing TELEGRAM_CHAT_ID');
-    throw new Error('Telegram chat ID is required');
-  }
-
-  // Validate Finnhub key format (free tier keys start with 'sandbox_' or 'c' + random chars)
-  if (!/^(sandbox_|c[a-z0-9]+)/i.test(config.finnhubKey)) {
-    console.error('Invalid Finnhub key format');
-    throw new Error('Invalid Finnhub API key format');
-  }
-
-  return config;
-};
-
-// 2. DEBUGGABLE FINNHUB SERVICE ================================
-class FinnhubWrapper {
-  constructor(apiKey) {
-    this.apiKey = apiKey;
-    this.client = this.createClient();
-  }
-
-  createClient() {
-    try {
-      const apiClient = new ApiClient();
-      apiClient.apiKey = this.apiKey;
-      
-      // Add debugging to the default headers
-      apiClient.defaultHeaders = {
-        ...apiClient.defaultHeaders,
-        'X-Debug-Mode': 'true',
-        'User-Agent': 'Vercel-Finnhub-Bot/1.0'
-      };
-      
-      return new DefaultApi(apiClient);
-    } catch (err) {
-      console.error('Client creation failed:', err);
-      throw new Error('Failed to initialize Finnhub client');
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
-  }
 
-  async testConnection() {
-    try {
-      const response = await new Promise((resolve, reject) => {
-        this.client.generalNews('general', {}, (err, data) => {
-          err ? reject(err) : resolve(data);
+    if (!FINNHUB_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+        console.error('Missing required environment variables.');
+        return res.status(500).json({
+            success: false,
+            message: 'Server configuration error: Missing API keys or chat ID.',
         });
-      });
-      return response.length > 0;
-    } catch (error) {
-      console.error('Connection test failed:', error);
-      throw new Error(`API connection failed: ${error.message}`);
     }
-  }
 
-  async getStockData(symbol = 'AAPL') {
-    const end = Math.floor(Date.now() / 1000);
-    const start = end - (30 * 24 * 60 * 60); // 30 days
-    
-    console.log(`Requesting ${symbol} data from ${new Date(start * 1000)} to ${new Date(end * 1000)}`);
-    
-    return new Promise((resolve, reject) => {
-      this.client.stockCandles(
-        symbol,
-        'D',
-        start,
-        end,
-        (error, data) => {
-          if (error) {
-            console.error('API Error:', {
-              status: error.status,
-              response: error.response?.text,
-              stack: error.stack
+    const { symbol } = req.query;
+
+    if (!symbol) {
+        return res.status(400).json({
+            success: false,
+            message: 'Stock symbol is required. Please provide it as a query parameter (e.g., ?symbol=AAPL).',
+        });
+    }
+
+    const finnhubUrl = `https://finnhub.io/api/v1/quote?symbol=${symbol.toUpperCase()}&token=${FINNHUB_API_KEY}`;
+    const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+    try {
+        // 1. Fetch stock data from Finnhub
+        console.log(`Fetching data for symbol: ${symbol.toUpperCase()} from Finnhub...`);
+        const finnhubResponse = await axios.get(finnhubUrl);
+        const quoteData = finnhubResponse.data;
+
+        // Validate Finnhub response
+        if (!quoteData || typeof quoteData.c === 'undefined' || quoteData.c === null || quoteData.c === 0) {
+            // c=0 can sometimes mean no data or market closed for a while for that symbol
+            console.warn(`No valid quote data received from Finnhub for ${symbol.toUpperCase()}:`, quoteData);
+            const errorMessage = `Could not retrieve valid quote data for symbol: ${symbol.toUpperCase()}. It might be an invalid symbol or no current data available.`;
+            
+            // Try to send this warning to Telegram as well
+            try {
+                await axios.post(telegramUrl, {
+                    chat_id: TELEGRAM_CHAT_ID,
+                    text: `⚠️ Warning: ${errorMessage}`,
+                    parse_mode: 'Markdown',
+                });
+            } catch (tgError) {
+                console.error('Failed to send warning to Telegram:', tgError.message);
+            }
+            
+            return res.status(404).json({
+                success: false,
+                message: errorMessage,
+                finnhub_response: quoteData // Include Finnhub response for debugging
             });
-            reject(new Error(`Finnhub API error: ${error.message}`));
-          } else if (data.s !== 'ok') {
-            console.error('Data Error:', {
-              status: data.s,
-              error: data.error
-            });
-            reject(new Error(data.error || 'Invalid market data received'));
-          } else if (!data.c || data.c.length === 0) {
-            reject(new Error('No closing prices available'));
-          } else {
-            resolve(data);
-          }
         }
-      );
-    });
-  }
-}
 
-// 3. MAIN FUNCTION WITH CONNECTION TESTING =====================
-module.exports = async (req, res) => {
-  console.log(`[${new Date().toISOString()}] Request started`);
-  
-  try {
-    // 1. Validate configuration
-    const config = validateConfig();
-    console.log('Configuration validated');
+        const {
+            c,  // Current price
+            h,  // High price of the day
+            l,  // Low price of the day
+            o,  // Open price of the day
+            pc, // Previous close price
+            t,  // Timestamp (Unix seconds)
+            dp  // Percent change
+        } = quoteData;
 
-    // 2. Initialize services
-    const finnhub = new FinnhubWrapper(config.finnhubKey);
-    const bot = new TelegramBot(config.telegramToken, { polling: false });
-    console.log('Services initialized');
+        // 2. Format the message for Telegram
+        const currentPrice = c.toFixed(2);
+        const highPrice = h.toFixed(2);
+        const lowPrice = l.toFixed(2);
+        const openPrice = o.toFixed(2);
+        const prevClosePrice = pc.toFixed(2);
+        const percentChange = dp.toFixed(2); // Use Finnhub's percent change
 
-    // 3. Test Finnhub connection first
-    console.log('Testing Finnhub connection...');
-    await finnhub.testConnection();
-    console.log('Finnhub connection successful');
+        const changeValue = (c - pc).toFixed(2);
+        const changeDirectionEmoji = dp >= 0 ? '💹 Up' : '🔻 Down';
+        const changeSign = dp >= 0 ? '+' : '';
 
-    // 4. Get market data
-    console.log('Fetching market data...');
-    const stockData = await finnhub.getStockData();
-    console.log(`Received ${stockData.c.length} data points`);
+        // Convert Unix timestamp (seconds) to a readable date string
+        // Adjust timezone as needed, e.g., 'America/New_York'
+        const readableTimestamp = new Date(t * 1000).toLocaleString('en-US', {
+            timeZone: 'UTC', // Finnhub timestamps are typically UTC
+            hour12: true,
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: 'numeric',
+            second: 'numeric'
+        });
 
-    // 5. Simple analysis
-    const closes = stockData.c.map(Number);
-    const lastClose = closes[closes.length - 1];
-    const sma5 = calculateSMA(closes, 5);
-    const sma20 = calculateSMA(closes, 20);
-    const signal = sma5 > sma20 ? 'BUY' : sma5 < sma20 ? 'SELL' : 'HOLD';
+        let message = `*📊 Stock Update: ${symbol.toUpperCase()}*\n\n`;
+        message += `Current Price: *$${currentPrice}*\n`;
+        message += `Change: ${changeDirectionEmoji} *$${changeValue}* (${changeSign}${percentChange}%)\n\n`;
+        message += `Open: $${openPrice}\n`;
+        message += `High: $${highPrice}\n`;
+        message += `Low: $${lowPrice}\n`;
+        message += `Previous Close: $${prevClosePrice}\n\n`;
+        message += `_Last updated (UTC): ${readableTimestamp}_`;
 
-    // 6. Send notification
-    const message = createSignalMessage('AAPL', signal, lastClose, sma5, sma20);
-    await bot.sendMessage(config.chatId, message, { parse_mode: 'Markdown' });
-    console.log('Telegram notification sent');
+        // 3. Send the message to Telegram
+        console.log(`Sending message to Telegram for chat ID: ${TELEGRAM_CHAT_ID}`);
+        await axios.post(telegramUrl, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: 'Markdown', // Use Markdown for formatting
+        });
 
-    res.status(200).json({
-      status: 'success',
-      signal,
-      price: lastClose,
-      sma5,
-      sma20
-    });
+        console.log(`Successfully sent stock data for ${symbol.toUpperCase()} to Telegram.`);
+        return res.status(200).json({
+            success: true,
+            message: `Stock data for ${symbol.toUpperCase()} sent to Telegram successfully.`,
+            data: {
+                symbol: symbol.toUpperCase(),
+                currentPrice: c,
+                percentChange: dp,
+                timestamp: t,
+            },
+        });
 
-  } catch (error) {
-    console.error('Fatal error:', {
-      message: error.message,
-      stack: error.stack
-    });
-    
-    res.status(500).json({
-      error: 'Trading signal failed',
-      details: error.message,
-      debug: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-};
+    } catch (error) {
+        console.error('Error in handler function:', error);
+        let errorMessage = 'An unexpected error occurred.';
+        let statusCode = 500;
 
-// Helper functions
-function calculateSMA(data, window) {
-  if (!data || data.length < window) return NaN;
-  const subset = data.slice(-window);
-  return subset.reduce((sum, val) => sum + val, 0) / window;
-}
+        if (error.response) {
+            // Error from an external API (Finnhub or Telegram)
+            console.error('API Error Status:', error.response.status);
+            console.error('API Error Data:', error.response.data);
+            errorMessage = `API request failed: ${error.response.data.message || error.message} (Status: ${error.response.status})`;
+            if (error.response.status === 401 || error.response.status === 403) {
+                errorMessage += " Check your API keys.";
+            } else if (error.response.status === 429) {
+                errorMessage += " Rate limit possibly exceeded.";
+            }
+            statusCode = error.response.status || 500;
+        } else if (error.request) {
+            // The request was made but no response was received
+            console.error('No response received:', error.request);
+            errorMessage = 'No response received from external API. Check network or API status.';
+            statusCode = 504; // Gateway Timeout
+        } else {
+            // Something happened in setting up the request that triggered an Error
+            console.error('Error setting up request:', error.message);
+            errorMessage = `Error: ${error.message}`;
+        }
 
-function createSignalMessage(symbol, signal, price, sma5, sma20) {
-  return [
-    `📊 *${symbol} Trading Signal*`,
-    '──────────────────',
-    `🟢 *Signal*: ${signal}`,
-    `💰 *Price*: $${price.toFixed(2)}`,
-    `📈 *5-Day SMA*: $${sma5.toFixed(2)}`,
-    `📉 *20-Day SMA*: $${sma20.toFixed(2)}`,
-    `⏱️ *Time*: ${new Date().toLocaleString()}`,
-    signal === 'BUY' ? '🚀 *Potential Buying Opportunity*' : '',
-    signal === 'SELL' ? '⚠️ *Consider Taking Profits*' : ''
-  ].filter(Boolean).join('\n');
+        return res.status(statusCode).json({
+            success: false,
+            message: errorMessage,
+            error_details: error.message // Keep original error message for context
+        });
+    }
 }
