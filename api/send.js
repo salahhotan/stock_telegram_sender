@@ -6,35 +6,16 @@ const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Initialize APIs
-const finnhubClient = new FinnhubAPI.ApiClient().apiKey(FINNHUB_API_KEY);
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
-
-// Simple trading strategy - Moving Average Crossover
-function analyzeStock(data) {
-  const closes = data.c.map(price => parseFloat(price));
-  const shortPeriod = 5;
-  const longPeriod = 20;
-  
-  // Calculate moving averages
-  const shortMA = calculateMA(closes, shortPeriod);
-  const longMA = calculateMA(closes, longPeriod);
-  
-  // Get current values
-  const lastShortMA = shortMA[shortMA.length - 1];
-  const lastLongMA = longMA[longMA.length - 1];
-  const prevShortMA = shortMA[shortMA.length - 2];
-  const prevLongMA = longMA[longMA.length - 2];
-  
-  // Generate signal
-  if (prevShortMA < prevLongMA && lastShortMA > lastLongMA) {
-    return 'BUY';
-  } else if (prevShortMA > prevLongMA && lastShortMA < lastLongMA) {
-    return 'SELL';
-  }
-  return 'HOLD';
+// Validate env vars
+if (!FINNHUB_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  throw new Error('Missing required environment variables');
 }
 
+// Initialize APIs
+const finnhubClient = new FinnhubAPI.DefaultApi(new FinnhubAPI.ApiClient().apiKey(FINNHUB_API_KEY));
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+
+// Helper functions
 function calculateMA(data, period) {
   return data.map((val, idx, arr) => {
     if (idx < period - 1) return null;
@@ -42,32 +23,64 @@ function calculateMA(data, period) {
   }).filter(val => val !== null);
 }
 
+function generateDates() {
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - (60 * 60 * 24 * 30); // 30 days data
+  return { start, end };
+}
+
+async function getStockData(symbol = 'AAPL') {
+  const { start, end } = generateDates();
+  return new Promise((resolve, reject) => {
+    finnhubClient.stockCandles(symbol, 'D', start, end, (error, data) => {
+      if (error) return reject(error);
+      if (data.s !== 'ok') return reject(new Error('Invalid stock data'));
+      resolve(data);
+    });
+  });
+}
+
+function analyzeStock(data) {
+  try {
+    const closes = data.c.map(price => parseFloat(price));
+    if (closes.length < 20) return 'INSUFFICIENT_DATA';
+    
+    const shortMA = calculateMA(closes, 5);
+    const longMA = calculateMA(closes, 20);
+    
+    const lastShort = shortMA[shortMA.length - 1];
+    const lastLong = longMA[longMA.length - 1];
+    const prevShort = shortMA[shortMA.length - 2];
+    const prevLong = longMA[longMA.length - 2];
+    
+    if (prevShort < prevLong && lastShort > lastLong) return 'BUY';
+    if (prevShort > prevLong && lastShort < lastLong) return 'SELL';
+    return 'HOLD';
+  } catch (error) {
+    console.error('Analysis error:', error);
+    return 'ERROR';
+  }
+}
+
 module.exports = async (req, res) => {
   try {
-    // Get stock data (example for Apple)
-    const stockData = await new Promise((resolve, reject) => {
-      finnhubClient.stockCandles("AAPL", "D", 1590988249, 1591852249, (error, data, response) => {
-        if (error) reject(error);
-        else resolve(data);
-      });
-    });
-    
-    // Analyze data
+    const stockData = await getStockData();
     const signal = analyzeStock(stockData);
-    
-    // Prepare message
     const lastClose = stockData.c[stockData.c.length - 1];
+    
     const message = `📈 Market Signal for AAPL
 🔴 Signal: ${signal}
-💰 Last Price: $${lastClose}
+💰 Last Price: $${lastClose.toFixed(2)}
 📅 ${new Date().toLocaleString()}`;
     
-    // Send to Telegram
     await bot.sendMessage(TELEGRAM_CHAT_ID, message);
+    res.status(200).json({ status: 'success', signal, price: lastClose });
     
-    res.status(200).json({ status: 'Signal sent', signal });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Endpoint error:', error);
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Check server logs for more information'
+    });
   }
 };
