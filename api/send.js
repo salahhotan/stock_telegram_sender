@@ -1,86 +1,140 @@
-const FinnhubAPI = require('finnhub');
+const { ApiClient, DefaultApi } = require('finnhub');
 const TelegramBot = require('node-telegram-bot-api');
 
-// Environment variables
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// 1. ENV VARIABLE VALIDATION ====================================
+const requiredEnvVars = [
+  'FINNHUB_API_KEY',
+  'TELEGRAM_BOT_TOKEN', 
+  'TELEGRAM_CHAT_ID'
+];
 
-// Validate env vars
-if (!FINNHUB_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-  throw new Error('Missing required environment variables');
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  throw new Error(`Missing env vars: ${missingVars.join(', ')}`);
 }
 
-// Initialize APIs
-const finnhubClient = new FinnhubAPI.DefaultApi(new FinnhubAPI.ApiClient().apiKey(FINNHUB_API_KEY));
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+const config = {
+  finnhubKey: process.env.FINNHUB_API_KEY,
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+  chatId: process.env.TELEGRAM_CHAT_ID
+};
 
-// Helper functions
-function calculateMA(data, period) {
-  return data.map((val, idx, arr) => {
-    if (idx < period - 1) return null;
-    return arr.slice(idx - period + 1, idx + 1).reduce((a, b) => a + b) / period;
-  }).filter(val => val !== null);
+// 2. CLIENT INITIALIZATION ======================================
+const apiClient = new ApiClient();
+apiClient.apiKey = config.finnhubKey;
+const finnhubClient = new DefaultApi(apiClient);
+
+const bot = new TelegramBot(config.telegramToken, {
+  polling: false
+});
+
+// 3. IMPROVED ANALYSIS FUNCTIONS ================================
+function calculateSMA(data, window) {
+  if (!data || data.length < window) return null;
+  
+  return data
+    .slice(-window)
+    .reduce((sum, price) => sum + price, 0) / window;
 }
 
-function generateDates() {
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - (60 * 60 * 24 * 30); // 30 days data
-  return { start, end };
-}
-
-async function getStockData(symbol = 'AAPL') {
-  const { start, end } = generateDates();
-  return new Promise((resolve, reject) => {
-    finnhubClient.stockCandles(symbol, 'D', start, end, (error, data) => {
-      if (error) return reject(error);
-      if (data.s !== 'ok') return reject(new Error('Invalid stock data'));
-      resolve(data);
-    });
-  });
-}
-
-function analyzeStock(data) {
+function generateSignal(stockData) {
   try {
-    const closes = data.c.map(price => parseFloat(price));
+    const closes = stockData.c.map(Number);
     if (closes.length < 20) return 'INSUFFICIENT_DATA';
-    
-    const shortMA = calculateMA(closes, 5);
-    const longMA = calculateMA(closes, 20);
-    
-    const lastShort = shortMA[shortMA.length - 1];
-    const lastLong = longMA[longMA.length - 1];
-    const prevShort = shortMA[shortMA.length - 2];
-    const prevLong = longMA[longMA.length - 2];
-    
-    if (prevShort < prevLong && lastShort > lastLong) return 'BUY';
-    if (prevShort > prevLong && lastShort < lastLong) return 'SELL';
+
+    const shortSMA = calculateSMA(closes, 5);
+    const longSMA = calculateSMA(closes, 20);
+    const prevShortSMA = calculateSMA(closes.slice(0, -1), 5);
+    const prevLongSMA = calculateSMA(closes.slice(0, -1), 20);
+
+    if (![shortSMA, longSMA, prevShortSMA, prevLongSMA].every(Boolean)) {
+      return 'ANALYSIS_ERROR';
+    }
+
+    if (prevShortSMA < prevLongSMA && shortSMA > longSMA) return 'BUY';
+    if (prevShortSMA > prevLongSMA && shortSMA < longSMA) return 'SELL';
     return 'HOLD';
   } catch (error) {
-    console.error('Analysis error:', error);
-    return 'ERROR';
+    console.error('Signal generation failed:', error);
+    return 'ANALYSIS_FAILED';
   }
 }
 
+// 4. MAIN FUNCTION WITH COMPREHENSIVE ERROR HANDLING ============
 module.exports = async (req, res) => {
+  console.log('Function started at', new Date().toISOString());
+  
   try {
-    const stockData = await getStockData();
-    const signal = analyzeStock(stockData);
+    // Get market data
+    const stockData = await new Promise((resolve, reject) => {
+      const end = Math.floor(Date.now() / 1000);
+      const start = end - (30 * 24 * 60 * 60); // 30 days
+      
+      finnhubClient.stockCandles(
+        'AAPL', 
+        'D', 
+        start, 
+        end,
+        (error, data) => {
+          if (error) {
+            console.error('Finnhub API error:', error);
+            return reject(new Error('Failed to fetch market data'));
+          }
+          if (data.s !== 'ok') {
+            console.error('Finnhub data error:', data);
+            return reject(new Error('Invalid market data received'));
+          }
+          resolve(data);
+        }
+      );
+    });
+
+    // Analysis
+    const signal = generateSignal(stockData);
     const lastClose = stockData.c[stockData.c.length - 1];
     
-    const message = `📈 Market Signal for AAPL
-🔴 Signal: ${signal}
-💰 Last Price: $${lastClose.toFixed(2)}
-📅 ${new Date().toLocaleString()}`;
-    
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message);
-    res.status(200).json({ status: 'success', signal, price: lastClose });
-    
+    // Prepare message
+    const message = [
+      '📈 *Market Signal Report*',
+      '────────────────────',
+      `• *Symbol*: AAPL`,
+      `• *Signal*: ${signal}`,
+      `• *Price*: $${lastClose.toFixed(2)}`,
+      `• *Time*: ${new Date().toLocaleString()}`,
+      signal === 'BUY' ? '🚀 *Potential Buying Opportunity*' : '',
+      signal === 'SELL' ? '⚠️ *Consider Taking Profits*' : ''
+    ].filter(Boolean).join('\n');
+
+    // Send to Telegram
+    await bot.sendMessage(config.chatId, message, {
+      parse_mode: 'Markdown'
+    });
+
+    console.log('Signal sent successfully:', signal);
+    res.status(200).json({
+      status: 'success',
+      signal,
+      price: lastClose,
+      timestamp: new Date().toISOString()
+    });
+
   } catch (error) {
-    console.error('Endpoint error:', error);
-    res.status(500).json({ 
-      error: error.message,
-      details: 'Check server logs for more information'
+    console.error('Fatal error:', error);
+    
+    // Attempt to send error notification
+    try {
+      await bot.sendMessage(
+        config.chatId,
+        `❌ *Error in Market Signal Bot*:\n${error.message}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (telegramError) {
+      console.error('Failed to send error notification:', telegramError);
+    }
+    
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
     });
   }
 };
