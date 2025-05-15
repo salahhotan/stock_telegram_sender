@@ -1,10 +1,20 @@
 {
-  // ... other configurations like name, version
+  "name": "stock-telegram-sender",
+  "version": "1.0.0",
+  "description": "A Vercel serverless function to fetch stock data from Finnhub and send it via Telegram.",
   "type": "module",
+  "scripts": {
+    "start": "echo \"No start script defined, deploy to Vercel to run the function.\"",
+    "dev": "vercel dev"
+  },
   "dependencies": {
-    "axios": "^1.0.0", // Or latest version
-    "dotenv": "^16.0.0" // Or latest version
-    // ... any other dependencies
-  }
-  // ...
+    "axios": "^1.6.8",  // Using a recent stable version of axios
+    "dotenv": "^16.4.5"   // Using a recent stable version of dotenv
+  },
+  "engines": {
+    "node": ">=18.x" // Specify a Node.js version compatible with Vercel and modern JS
+  },
+  "author": "salahhotan (original author), updated by AI", // Or your name
+  "license": "ISC", // Or "MIT", or whatever license the original repo uses if specified
+  "private": true // Good practice if it's not intended to be an npm package
 }
