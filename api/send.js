@@ -1,140 +1,151 @@
 const { ApiClient, DefaultApi } = require('finnhub');
 const TelegramBot = require('node-telegram-bot-api');
 
-// 1. ENV VARIABLE VALIDATION ====================================
-const requiredEnvVars = [
-  'FINNHUB_API_KEY',
-  'TELEGRAM_BOT_TOKEN', 
-  'TELEGRAM_CHAT_ID'
-];
+// 1. SUPER ROBUST CONFIGURATION ================================
+const getConfig = () => {
+  const env = {
+    finnhubKey: process.env.FINNHUB_API_KEY,
+    telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID
+  };
 
-const missingVars = requiredEnvVars.filter(v => !process.env[v]);
-if (missingVars.length > 0) {
-  throw new Error(`Missing env vars: ${missingVars.join(', ')}`);
-}
+  // Validate configuration
+  if (!env.finnhubKey) throw new Error('FINNHUB_API_KEY is required');
+  if (!env.telegramToken) throw new Error('TELEGRAM_BOT_TOKEN is required');
+  if (!env.chatId) throw new Error('TELEGRAM_CHAT_ID is required');
 
-const config = {
-  finnhubKey: process.env.FINNHUB_API_KEY,
-  telegramToken: process.env.TELEGRAM_BOT_TOKEN,
-  chatId: process.env.TELEGRAM_CHAT_ID
+  return env;
 };
 
-// 2. CLIENT INITIALIZATION ======================================
-const apiClient = new ApiClient();
-apiClient.apiKey = config.finnhubKey;
-const finnhubClient = new DefaultApi(apiClient);
+// 2. ENHANCED FINNHUB CLIENT ===================================
+class FinnhubService {
+  constructor(apiKey) {
+    const apiClient = new ApiClient();
+    apiClient.apiKey = apiKey;
+    this.client = new DefaultApi(apiClient);
+  }
 
-const bot = new TelegramBot(config.telegramToken, {
-  polling: false
-});
+  async getStockCandles(symbol, timeframe, days) {
+    return new Promise((resolve, reject) => {
+      try {
+        const end = Math.floor(Date.now() / 1000);
+        const start = end - (days * 24 * 60 * 60);
 
-// 3. IMPROVED ANALYSIS FUNCTIONS ================================
-function calculateSMA(data, window) {
-  if (!data || data.length < window) return null;
-  
-  return data
-    .slice(-window)
-    .reduce((sum, price) => sum + price, 0) / window;
-}
+        console.log(`Fetching ${symbol} data (${timeframe}) from ${new Date(start * 1000)} to ${new Date(end * 1000)}`);
 
-function generateSignal(stockData) {
-  try {
-    const closes = stockData.c.map(Number);
-    if (closes.length < 20) return 'INSUFFICIENT_DATA';
+        this.client.stockCandles(symbol, timeframe, start, end, (error, data) => {
+          if (error) {
+            console.error('Finnhub API Error:', error);
+            return reject(new Error(`Finnhub API failed: ${error.message}`));
+          }
 
-    const shortSMA = calculateSMA(closes, 5);
-    const longSMA = calculateSMA(closes, 20);
-    const prevShortSMA = calculateSMA(closes.slice(0, -1), 5);
-    const prevLongSMA = calculateSMA(closes.slice(0, -1), 20);
+          if (data.s !== 'ok') {
+            const errorMsg = `Finnhub data error: ${data.error || 'Unknown error'}`;
+            console.error(errorMsg);
+            return reject(new Error(errorMsg));
+          }
 
-    if (![shortSMA, longSMA, prevShortSMA, prevLongSMA].every(Boolean)) {
-      return 'ANALYSIS_ERROR';
-    }
+          if (!data.c || data.c.length === 0) {
+            return reject(new Error('No closing prices received'));
+          }
 
-    if (prevShortSMA < prevLongSMA && shortSMA > longSMA) return 'BUY';
-    if (prevShortSMA > prevLongSMA && shortSMA < longSMA) return 'SELL';
-    return 'HOLD';
-  } catch (error) {
-    console.error('Signal generation failed:', error);
-    return 'ANALYSIS_FAILED';
+          resolve(data);
+        });
+      } catch (err) {
+        reject(new Error(`Finnhub service error: ${err.message}`));
+      }
+    });
   }
 }
 
-// 4. MAIN FUNCTION WITH COMPREHENSIVE ERROR HANDLING ============
-module.exports = async (req, res) => {
-  console.log('Function started at', new Date().toISOString());
-  
-  try {
-    // Get market data
-    const stockData = await new Promise((resolve, reject) => {
-      const end = Math.floor(Date.now() / 1000);
-      const start = end - (30 * 24 * 60 * 60); // 30 days
-      
-      finnhubClient.stockCandles(
-        'AAPL', 
-        'D', 
-        start, 
-        end,
-        (error, data) => {
-          if (error) {
-            console.error('Finnhub API error:', error);
-            return reject(new Error('Failed to fetch market data'));
-          }
-          if (data.s !== 'ok') {
-            console.error('Finnhub data error:', data);
-            return reject(new Error('Invalid market data received'));
-          }
-          resolve(data);
-        }
-      );
-    });
+// 3. TELEGRAM SERVICE WITH RETRIES =============================
+class TelegramService {
+  constructor(token) {
+    this.bot = new TelegramBot(token, { polling: false });
+    this.maxRetries = 3;
+  }
 
-    // Analysis
-    const signal = generateSignal(stockData);
-    const lastClose = stockData.c[stockData.c.length - 1];
+  async sendMessage(chatId, text, options = {}) {
+    let attempts = 0;
     
-    // Prepare message
+    while (attempts < this.maxRetries) {
+      try {
+        attempts++;
+        await this.bot.sendMessage(chatId, text, options);
+        return;
+      } catch (error) {
+        if (attempts === this.maxRetries) {
+          throw new Error(`Failed after ${this.maxRetries} attempts: ${error.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+      }
+    }
+  }
+}
+
+// 4. MAIN FUNCTION =============================================
+module.exports = async (req, res) => {
+  const startTime = Date.now();
+  console.log(`[${new Date().toISOString()}] Function started`);
+
+  try {
+    const config = getConfig();
+    const finnhub = new FinnhubService(config.finnhubKey);
+    const telegram = new TelegramService(config.telegramToken);
+
+    // Fetch data with enhanced error handling
+    const stockData = await finnhub.getStockCandles('AAPL', 'D', 30)
+      .catch(err => {
+        console.error('Data fetch failed:', err);
+        throw new Error(`Market data unavailable: ${err.message}`);
+      });
+
+    // Simple analysis
+    const closes = stockData.c.map(Number);
+    const lastClose = closes[closes.length - 1];
+    const sma5 = calculateSMA(closes, 5);
+    const sma20 = calculateSMA(closes, 20);
+    
+    const signal = sma5 > sma20 ? 'BUY' : 'HOLD';
+
+    // Format message
     const message = [
-      '📈 *Market Signal Report*',
-      '────────────────────',
+      '📊 *Market Signal*',
+      '──────────────',
       `• *Symbol*: AAPL`,
       `• *Signal*: ${signal}`,
       `• *Price*: $${lastClose.toFixed(2)}`,
-      `• *Time*: ${new Date().toLocaleString()}`,
-      signal === 'BUY' ? '🚀 *Potential Buying Opportunity*' : '',
-      signal === 'SELL' ? '⚠️ *Consider Taking Profits*' : ''
-    ].filter(Boolean).join('\n');
+      `• *5-Day SMA*: $${sma5.toFixed(2)}`,
+      `• *20-Day SMA*: $${sma20.toFixed(2)}`,
+      `• *Updated*: ${new Date().toLocaleString()}`
+    ].join('\n');
 
-    // Send to Telegram
-    await bot.sendMessage(config.chatId, message, {
-      parse_mode: 'Markdown'
-    });
+    // Send notification
+    await telegram.sendMessage(config.chatId, message, { parse_mode: 'Markdown' });
 
-    console.log('Signal sent successfully:', signal);
+    console.log(`[SUCCESS] Execution time: ${Date.now() - startTime}ms`);
     res.status(200).json({
       status: 'success',
       signal,
       price: lastClose,
+      sma5,
+      sma20,
       timestamp: new Date().toISOString()
     });
 
   } catch (error) {
-    console.error('Fatal error:', error);
-    
-    // Attempt to send error notification
-    try {
-      await bot.sendMessage(
-        config.chatId,
-        `❌ *Error in Market Signal Bot*:\n${error.message}`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (telegramError) {
-      console.error('Failed to send error notification:', telegramError);
-    }
-    
+    console.error(`[ERROR] ${error.message}`);
     res.status(500).json({
-      error: 'Internal server error',
-      details: error.message
+      error: 'Trading signal failed',
+      details: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 };
+
+// Helper function
+function calculateSMA(data, window) {
+  if (!data || data.length < window) return NaN;
+  const subset = data.slice(-window);
+  return subset.reduce((sum, val) => sum + val, 0) / window;
+}
