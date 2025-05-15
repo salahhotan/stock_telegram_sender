@@ -1,6 +1,10 @@
 {
+  // ... other configurations like name, version
+  "type": "module",
   "dependencies": {
-    "finnhub": "^1.2.7",
-    "node-telegram-bot-api": "^0.61.0"
+    "axios": "^1.0.0", // Or latest version
+    "dotenv": "^16.0.0" // Or latest version
+    // ... any other dependencies
   }
+  // ...
 }
