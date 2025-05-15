@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "finnhub": "^1.2.6",
-    "node-telegram-bot-api": "^0.56.0"
+    "finnhub": "^1.2.7",
+    "node-telegram-bot-api": "^0.61.0"
   }
 }
