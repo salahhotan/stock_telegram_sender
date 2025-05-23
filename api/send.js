@@ -7,32 +7,26 @@ dotenv.config();
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-// Valid stock symbols: 1-5 uppercase letters
 const SYMBOL_REGEX = /^[A-Z]{1,5}$/;
-const requestCache = new Map();
-const CACHE_TTL = 30000; // 30 seconds
 
-// Helper function to send errors to Telegram
-async function sendErrorToTelegram(errorMessage, errorDetails = '') {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    
+// Helper function to send messages to Telegram
+async function sendTelegramMessage(text, isError = false) {
     const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     try {
         await axios.post(telegramUrl, {
             chat_id: TELEGRAM_CHAT_ID,
-            text: `🚨 *Error Alert* 🚨\n\n${errorMessage}\n\n${errorDetails}`,
+            text: isError ? `❌ Error: ${text}` : text,
             parse_mode: 'Markdown',
         }, {
             timeout: 3000
         });
     } catch (tgError) {
-        console.error('Failed to send error to Telegram:', tgError.message);
+        console.error('Failed to send Telegram message:', tgError.message);
     }
 }
 
 export default async function handler(req, res) {
-    // CORS headers
+    // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -41,14 +35,19 @@ export default async function handler(req, res) {
         return res.status(200).end();
     }
 
+    // 1. First send hello message
+    try {
+        await sendTelegramMessage(`👋 Hello! Starting stock data request...`);
+    } catch (helloError) {
+        console.error('Failed to send hello message:', helloError);
+        // Continue execution even if hello message fails
+    }
+
     // Validate environment variables
     if (!FINNHUB_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-        const errorMessage = 'Missing required environment variables';
-        console.error(errorMessage);
-        await sendErrorToTelegram(
-            'Server Configuration Error',
-            'Missing one or more required environment variables (FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)'
-        );
+        const errorMsg = 'Missing required environment variables.';
+        console.error(errorMsg);
+        await sendTelegramMessage(errorMsg, true);
         return res.status(500).json({
             success: false,
             message: 'Server configuration error',
@@ -59,179 +58,96 @@ export default async function handler(req, res) {
 
     // Validate symbol input
     if (!symbol || !SYMBOL_REGEX.test(symbol.toUpperCase())) {
-        const errorMessage = `Invalid stock symbol request: ${symbol}`;
-        await sendErrorToTelegram(
-            'Invalid Stock Symbol',
-            `Received invalid symbol: ${symbol}`
-        );
+        const errorMsg = `Invalid stock symbol: ${symbol}. Please provide a valid 1-5 character ticker symbol.`;
+        await sendTelegramMessage(errorMsg, true);
         return res.status(400).json({
             success: false,
-            message: 'Invalid stock symbol. Please provide a valid 1-5 character ticker symbol.',
+            message: errorMsg,
         });
     }
 
     const uppercaseSymbol = symbol.toUpperCase();
-    const cacheKey = `symbol:${uppercaseSymbol}`;
-
-    // Check cache
-    if (requestCache.has(cacheKey)) {
-        const cached = requestCache.get(cacheKey);
-        if (Date.now() - cached.timestamp < CACHE_TTL) {
-            return res.status(200).json(cached.data);
-        }
-    }
-
     const finnhubUrl = `https://finnhub.io/api/v1/quote?symbol=${uppercaseSymbol}&token=${FINNHUB_API_KEY}`;
 
     try {
         // Fetch data from Finnhub
+        await sendTelegramMessage(`🔍 Fetching data for ${uppercaseSymbol}...`);
+        
         const finnhubResponse = await axios.get(finnhubUrl, {
             timeout: 5000,
-            headers: {
-                'Accept-Encoding': 'application/json',
-            }
+            headers: { 'Accept-Encoding': 'application/json' }
         });
 
         const quoteData = finnhubResponse.data;
 
         // Validate response
         if (!quoteData || typeof quoteData !== 'object') {
-            const errorMessage = `Invalid response format from Finnhub for ${uppercaseSymbol}`;
-            await sendErrorToTelegram(
-                'Finnhub API Format Error',
-                errorMessage
-            );
-            throw new Error(errorMessage);
+            throw new Error('Invalid response format from Finnhub');
         }
 
-        // Check for empty response
         if (quoteData.c === 0 && quoteData.dp === null) {
-            const errorMessage = `No data available for symbol: ${uppercaseSymbol}`;
-            await sendErrorToTelegram(
-                'Stock Data Unavailable',
-                errorMessage
-            );
+            const errorMsg = `No data available for symbol: ${uppercaseSymbol}`;
+            await sendTelegramMessage(errorMsg, true);
             return res.status(404).json({
                 success: false,
-                message: errorMessage,
+                message: errorMsg,
             });
         }
 
-        // Format data safely
-        const formatPrice = (value) => {
-            if (value === null || value === undefined) return 'N/A';
-            return typeof value === 'number' ? value.toFixed(2) : value;
-        };
-
+        // Format data
+        const formatPrice = (value) => value?.toFixed(2) ?? 'N/A';
         const currentPrice = formatPrice(quoteData.c);
-        const highPrice = formatPrice(quoteData.h);
-        const lowPrice = formatPrice(quoteData.l);
-        const openPrice = formatPrice(quoteData.o);
-        const prevClosePrice = formatPrice(quoteData.pc);
-        const percentChange = quoteData.dp ? formatPrice(quoteData.dp) : '0.00';
-        const changeValue = quoteData.c && quoteData.pc 
-            ? (quoteData.c - quoteData.pc).toFixed(2) 
-            : 'N/A';
+        const percentChange = formatPrice(quoteData.dp);
+        const changeValue = (quoteData.c - quoteData.pc).toFixed(2);
+        const changeDirection = quoteData.dp >= 0 ? '💹 Up' : '🔻 Down';
 
-        const changeDirectionEmoji = quoteData.dp >= 0 ? '💹 Up' : '🔻 Down';
-        const changeSign = quoteData.dp >= 0 ? '+' : '';
-        const isMarketClosed = quoteData.c === quoteData.pc;
-        const timestamp = quoteData.t ? new Date(quoteData.t * 1000) : new Date();
+        // Create message
+        const message = [
+            `*📊 ${uppercaseSymbol} Stock Update*`,
+            `Current: *$${currentPrice}*`,
+            `Change: ${changeDirection} *$${changeValue}* (${quoteData.dp >= 0 ? '+' : ''}${percentChange}%)`,
+            `High: $${formatPrice(quoteData.h)}`,
+            `Low: $${formatPrice(quoteData.l)}`,
+            `Prev Close: $${formatPrice(quoteData.pc)}`,
+            `_Updated: ${new Date(quoteData.t * 1000).toUTCString()}_`
+        ].join('\n');
 
-        // Build Telegram message
-        let message = `*📊 Stock Update: ${uppercaseSymbol}*\n\n`;
-        message += `Current Price: *$${currentPrice}*\n`;
-        message += `Change: ${changeDirectionEmoji} *$${changeValue}* (${changeSign}${percentChange}%)\n\n`;
-        message += `Open: $${openPrice}\n`;
-        message += `High: $${highPrice}\n`;
-        message += `Low: $${lowPrice}\n`;
-        message += `Previous Close: $${prevClosePrice}\n\n`;
+        // Send final message
+        await sendTelegramMessage(message);
         
-        if (isMarketClosed) {
-            message += `🛑 *Market is currently closed*\n`;
-        }
-        
-        message += `_Last updated (UTC): ${timestamp.toLocaleString('en-US', {
-            timeZone: 'UTC',
-            hour12: true,
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-            hour: 'numeric',
-            minute: 'numeric',
-        })}_`;
-
-        // Send to Telegram
-        const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        await axios.post(telegramUrl, {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown',
-        }, {
-            timeout: 3000
-        });
-
-        // Cache response
-        const responseData = {
+        return res.status(200).json({
             success: true,
-            message: `Stock data for ${uppercaseSymbol} sent to Telegram successfully.`,
+            message: `Stock data for ${uppercaseSymbol} sent to Telegram`,
             data: {
                 symbol: uppercaseSymbol,
                 currentPrice: quoteData.c,
                 percentChange: quoteData.dp,
-                timestamp: quoteData.t,
             },
-        };
-
-        requestCache.set(cacheKey, {
-            timestamp: Date.now(),
-            data: responseData
         });
-
-        return res.status(200).json(responseData);
 
     } catch (error) {
         console.error('Error:', error);
         
-        // Prepare error details for Telegram
-        let errorDetails = `🔍 *Error Details:*\n`;
-        errorDetails += `• Symbol: ${uppercaseSymbol}\n`;
-        errorDetails += `• Time: ${new Date().toISOString()}\n`;
+        // Prepare detailed error message
+        let errorDetails = `Error processing ${uppercaseSymbol || 'unknown symbol'}: `;
         
         if (error.response) {
-            errorDetails += `• API Status: ${error.response.status}\n`;
-            errorDetails += `• API Data: ${JSON.stringify(error.response.data)}\n`;
+            errorDetails += `API responded with ${error.response.status}: ${error.response.data?.message || 'No error details'}`;
         } else if (error.request) {
-            errorDetails += `• No response received\n`;
+            errorDetails += 'No response received from API';
         } else {
-            errorDetails += `• Error Message: ${error.message}\n`;
+            errorDetails += error.message;
         }
 
         // Send error to Telegram
-        await sendErrorToTelegram(
-            `Failed to process stock data for ${uppercaseSymbol}`,
-            errorDetails
-        );
+        await sendTelegramMessage(errorDetails, true);
 
         // Return appropriate response
-        if (error.response?.status === 429) {
-            return res.status(429).json({
-                success: false,
-                message: 'Rate limit exceeded. Please try again later.',
-            });
-        }
-
-        if (error.code === 'ECONNABORTED') {
-            return res.status(504).json({
-                success: false,
-                message: 'Request timeout. The stock data service is currently unavailable.',
-            });
-        }
-
-        return res.status(500).json({
+        const statusCode = error.response?.status || 500;
+        return res.status(statusCode).json({
             success: false,
-            message: 'Failed to fetch stock data. Our team has been notified.',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+            message: 'Failed to process stock data',
+            error: process.env.NODE_ENV === 'development' ? errorDetails : undefined,
         });
     }
 }
